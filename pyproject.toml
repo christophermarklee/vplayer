@@ -10,4 +10,5 @@ dependencies = [
     "ollama>=0.6.2",
     "opencv-python>=4.13.0.92",
     "pillow>=12.2.0",
+    "pyside6>=6.9.1",
 ]

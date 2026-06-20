@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import importlib
 import os
 import queue
 import select
@@ -217,6 +218,11 @@ def parse_args() -> argparse.Namespace:
         "--ollama-host",
         default=None,
         help="Optional Ollama host URL, for example http://127.0.0.1:11434.",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch the desktop GUI instead of the OpenCV preview loop.",
     )
     return parser.parse_args()
 
@@ -789,8 +795,7 @@ def submit_latest(jobs: queue.Queue[FrameJob], job: FrameJob) -> None:
         pass
 
 
-def main() -> int:
-    args = parse_args()
+def validate_args(args: argparse.Namespace) -> None:
     if args.interval <= 0:
         raise ValueError("--interval must be greater than 0.")
     if args.max_width <= 0:
@@ -804,7 +809,12 @@ def main() -> int:
     if args.capture == "mss" and args.wayland_source != "screen":
         raise ValueError("--wayland-source is only supported with --capture portal/auto.")
 
+
+def run_cli(args: argparse.Namespace) -> int:
+    validate_args(args)
+
     stop_event = threading.Event()
+    capture = create_capture_backend(args)
 
     client_kwargs = {"timeout": args.vlm_timeout}
     client = (
@@ -838,7 +848,6 @@ def main() -> int:
     last_printed_response = ""
     preview_frames_seen = 0
     blank_capture_warned = False
-    capture = create_capture_backend(args)
     first_capture_read = True
     try:
         try:
@@ -893,12 +902,402 @@ def main() -> int:
         except KeyboardInterrupt:
             stop_event.set()
     finally:
-        capture.close()
+        with contextlib.suppress(Exception):
+            capture.close()
 
     stop_event.set()
-    worker.join(timeout=1.0)
+    worker.join(timeout=2.0)
     cv2.destroyAllWindows()
     return 0
+
+
+def run_gui(args: argparse.Namespace) -> int:
+    try:
+        QtCore = importlib.import_module("PySide6.QtCore")
+        QtGui = importlib.import_module("PySide6.QtGui")
+        QtWidgets = importlib.import_module("PySide6.QtWidgets")
+    except ImportError as exc:
+        raise RuntimeError(
+            "GUI mode requires PySide6. Install dependencies with `uv sync`."
+        ) from exc
+
+    validate_args(args)
+
+    class VPlayerWindow(QtWidgets.QMainWindow):
+        def __init__(self, initial: argparse.Namespace) -> None:
+            super().__init__()
+            self.setWindowTitle("vplayer")
+            self.resize(1200, 760)
+
+            self._args = initial
+            self._stop_event = threading.Event()
+            self._capture: CaptureBackend | None = None
+            self._capture_thread: threading.Thread | None = None
+            self._worker_thread: threading.Thread | None = None
+            self._jobs: queue.Queue[FrameJob] | None = None
+            self._response_lock = threading.Lock()
+            self._frame_lock = threading.Lock()
+            self._latest_response = {"text": "Ready."}
+            self._latest_frame: np.ndarray | None = None
+            self._next_submit_at = 0.0
+            self._is_stopping = False
+
+            self._build_ui()
+
+            self._ui_timer = QtCore.QTimer(self)
+            self._ui_timer.setInterval(33)
+            self._ui_timer.timeout.connect(self._refresh_preview)
+            self._ui_timer.start()
+
+        def _build_ui(self) -> None:
+            central = QtWidgets.QWidget(self)
+            self.setCentralWidget(central)
+
+            root = QtWidgets.QHBoxLayout(central)
+            root.setContentsMargins(16, 16, 16, 16)
+            root.setSpacing(16)
+
+            control_card = QtWidgets.QFrame()
+            control_card.setObjectName("controlCard")
+            control_card.setMinimumWidth(340)
+            controls = QtWidgets.QVBoxLayout(control_card)
+            controls.setContentsMargins(16, 16, 16, 16)
+            controls.setSpacing(10)
+
+            title = QtWidgets.QLabel("Desktop Vision Player")
+            title.setObjectName("title")
+            subtitle = QtWidgets.QLabel("Live capture + local Ollama VLM")
+            subtitle.setObjectName("subtitle")
+            controls.addWidget(title)
+            controls.addWidget(subtitle)
+
+            self.model_edit = QtWidgets.QLineEdit(self._args.model)
+            self.prompt_edit = QtWidgets.QPlainTextEdit(self._args.prompt)
+            self.prompt_edit.setMinimumHeight(96)
+            self.capture_combo = QtWidgets.QComboBox()
+            self.capture_combo.addItems(["auto", "portal", "mss"])
+            self.capture_combo.setCurrentText(self._args.capture)
+            self.source_combo = QtWidgets.QComboBox()
+            self.source_combo.addItems(["screen", "window", "selection"])
+            self.source_combo.setCurrentText(self._args.wayland_source)
+            self.interval_spin = QtWidgets.QDoubleSpinBox()
+            self.interval_spin.setRange(0.2, 300.0)
+            self.interval_spin.setValue(self._args.interval)
+            self.interval_spin.setSingleStep(0.2)
+            self.max_width_spin = QtWidgets.QSpinBox()
+            self.max_width_spin.setRange(128, 4096)
+            self.max_width_spin.setValue(self._args.max_width)
+            self.analysis_width_spin = QtWidgets.QSpinBox()
+            self.analysis_width_spin.setRange(64, 2048)
+            self.analysis_width_spin.setValue(self._args.analysis_width)
+            self.monitor_spin = QtWidgets.QSpinBox()
+            self.monitor_spin.setRange(1, 16)
+            self.monitor_spin.setValue(self._args.monitor)
+            self.num_predict_spin = QtWidgets.QSpinBox()
+            self.num_predict_spin.setRange(8, 2048)
+            self.num_predict_spin.setValue(self._args.num_predict)
+            self.jpeg_spin = QtWidgets.QSpinBox()
+            self.jpeg_spin.setRange(20, 100)
+            self.jpeg_spin.setValue(self._args.jpeg_quality)
+            self.timeout_spin = QtWidgets.QDoubleSpinBox()
+            self.timeout_spin.setRange(5.0, 600.0)
+            self.timeout_spin.setValue(self._args.vlm_timeout)
+
+            fields: list[tuple[str, object]] = [
+                ("Model", self.model_edit),
+                ("Prompt", self.prompt_edit),
+                ("Capture", self.capture_combo),
+                ("Source", self.source_combo),
+                ("Monitor (mss)", self.monitor_spin),
+                ("Interval (s)", self.interval_spin),
+                ("Max Width", self.max_width_spin),
+                ("Analysis Width", self.analysis_width_spin),
+                ("Num Predict", self.num_predict_spin),
+                ("JPEG Quality", self.jpeg_spin),
+                ("VLM Timeout (s)", self.timeout_spin),
+            ]
+            for label_text, widget in fields:
+                label = QtWidgets.QLabel(label_text)
+                label.setObjectName("fieldLabel")
+                controls.addWidget(label)
+                controls.addWidget(widget)
+
+            self.start_button = QtWidgets.QPushButton("Start")
+            self.stop_button = QtWidgets.QPushButton("Stop")
+            self.stop_button.setEnabled(False)
+            buttons = QtWidgets.QHBoxLayout()
+            buttons.addWidget(self.start_button)
+            buttons.addWidget(self.stop_button)
+            controls.addLayout(buttons)
+            controls.addStretch(1)
+
+            right = QtWidgets.QVBoxLayout()
+            right.setSpacing(12)
+            self.preview = QtWidgets.QLabel("Press Start to begin capture")
+            self.preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.preview.setMinimumSize(720, 405)
+            self.preview.setObjectName("preview")
+            self.response = QtWidgets.QPlainTextEdit()
+            self.response.setReadOnly(True)
+            self.response.setPlaceholderText("VLM output appears here...")
+            self.response.setObjectName("response")
+            self.response.setMinimumHeight(160)
+
+            right.addWidget(self.preview, stretch=1)
+            right.addWidget(self.response, stretch=0)
+
+            root.addWidget(control_card)
+            root.addLayout(right, stretch=1)
+
+            self.status_label = QtWidgets.QLabel("Idle")
+            self.statusBar().addPermanentWidget(self.status_label)
+
+            self.start_button.clicked.connect(self._start)
+            self.stop_button.clicked.connect(self._stop)
+            self.capture_combo.currentTextChanged.connect(self._update_control_state)
+            self._update_control_state()
+
+            self.setStyleSheet(
+                """
+                QMainWindow { background: #f3ede3; }
+                #controlCard {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #1f3a5f, stop:1 #27496d);
+                    border-radius: 16px;
+                }
+                #title { color: #f8f5ee; font-size: 22px; font-weight: 700; }
+                #subtitle { color: #d4dfeb; font-size: 13px; }
+                #fieldLabel { color: #e6edf5; font-size: 12px; margin-top: 6px; }
+                QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                    background: rgba(255, 255, 255, 0.95);
+                    border: 1px solid rgba(0, 0, 0, 0.16);
+                    border-radius: 10px;
+                    padding: 6px;
+                    color: #0f1720;
+                }
+                QPushButton {
+                    background: #e9c46a;
+                    border: none;
+                    border-radius: 10px;
+                    padding: 8px 14px;
+                    color: #1a1a1a;
+                    font-weight: 600;
+                }
+                QPushButton:disabled {
+                    background: #b9bfc6;
+                    color: #5d646d;
+                }
+                #preview {
+                    background: qradialgradient(cx:0.5, cy:0.4, radius:1.0,
+                        fx:0.45, fy:0.35, stop:0 #3a4f61, stop:1 #121a24);
+                    border-radius: 16px;
+                    color: #e7ecf1;
+                    font-size: 15px;
+                    padding: 10px;
+                }
+                #response {
+                    background: #fffefc;
+                    border: 1px solid #d1c6b5;
+                    border-radius: 14px;
+                    color: #192430;
+                }
+                QStatusBar { background: #ece2d2; color: #243040; }
+                """
+            )
+
+        def _update_control_state(self) -> None:
+            is_mss = self.capture_combo.currentText() == "mss"
+            self.monitor_spin.setEnabled(is_mss)
+            self.source_combo.setEnabled(not is_mss)
+
+        def _collect_args(self) -> argparse.Namespace:
+            return argparse.Namespace(
+                model=self.model_edit.text().strip() or DEFAULT_MODEL,
+                prompt=self.prompt_edit.toPlainText().strip() or DEFAULT_PROMPT,
+                monitor=int(self.monitor_spin.value()),
+                capture=self.capture_combo.currentText(),
+                wayland_source=self.source_combo.currentText(),
+                max_width=int(self.max_width_spin.value()),
+                analysis_width=int(self.analysis_width_spin.value()),
+                interval=float(self.interval_spin.value()),
+                num_predict=int(self.num_predict_spin.value()),
+                vlm_timeout=float(self.timeout_spin.value()),
+                jpeg_quality=int(self.jpeg_spin.value()),
+                no_preview=True,
+                ollama_host=self._args.ollama_host,
+                gui=True,
+            )
+
+        def _start(self) -> None:
+            if self._capture_thread and self._capture_thread.is_alive():
+                return
+
+            args_now = self._collect_args()
+            try:
+                validate_args(args_now)
+                client_kwargs = {"timeout": args_now.vlm_timeout}
+                client = (
+                    Client(host=args_now.ollama_host, **client_kwargs)
+                    if args_now.ollama_host
+                    else Client(**client_kwargs)
+                )
+                capture = create_capture_backend(args_now)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, "Unable to start", str(exc))
+                return
+
+            self._args = args_now
+            self._stop_event.clear()
+            self._capture = capture
+            self._jobs = queue.Queue(maxsize=1)
+            self._next_submit_at = 0.0
+            with self._response_lock:
+                self._latest_response["text"] = (
+                    f"VLM: waiting for first frame ({self._args.model})..."
+                )
+
+            self._worker_thread = threading.Thread(
+                target=vlm_worker,
+                args=(
+                    client,
+                    self._args.model,
+                    self._args.prompt,
+                    self._args.analysis_width,
+                    self._args.jpeg_quality,
+                    self._args.num_predict,
+                    self._jobs,
+                    self._stop_event,
+                    self._response_lock,
+                    self._latest_response,
+                ),
+                daemon=True,
+            )
+            self._worker_thread.start()
+
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop,
+                daemon=True,
+            )
+            self._capture_thread.start()
+
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.status_label.setText("Running")
+
+        def _capture_loop(self) -> None:
+            assert self._capture is not None
+            while not self._stop_event.is_set():
+                try:
+                    frame = self._capture.read()
+                    frame = resize_to_width(frame, self._args.max_width)
+                except Exception as exc:
+                    with self._response_lock:
+                        self._latest_response["text"] = f"Capture error: {exc}"
+                    self._stop_event.set()
+                    break
+
+                capture_warning = BLANK_CAPTURE_WARNING if frame_is_blank(frame) else ""
+                with self._frame_lock:
+                    self._latest_frame = frame.copy()
+
+                now = time.monotonic()
+                if not capture_warning and self._jobs is not None and now >= self._next_submit_at:
+                    submit_latest(
+                        self._jobs,
+                        FrameJob(frame=frame.copy(), captured_at=time.time()),
+                    )
+                    self._next_submit_at = now + self._args.interval
+
+                if capture_warning:
+                    with self._response_lock:
+                        self._latest_response["text"] = capture_warning
+
+        def _refresh_preview(self) -> None:
+            with self._frame_lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+            with self._response_lock:
+                response_text = self._latest_response["text"]
+
+            self.response.setPlainText(response_text)
+            source_label = SOURCE_LABELS[self._args.wayland_source]
+            self.status_label.setText(
+                f"{self._args.model} | {source_label} | every {self._args.interval:.1f}s"
+            )
+
+            if frame is None:
+                return
+
+            status = f"{self._args.model} | {source_label} | q in CLI only"
+            preview = draw_status(frame, status, response_text)
+            rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+            height, width, _ = rgb.shape
+            image = QtGui.QImage(
+                rgb.data,
+                width,
+                height,
+                width * 3,
+                QtGui.QImage.Format.Format_RGB888,
+            ).copy()
+            pixmap = QtGui.QPixmap.fromImage(image)
+            self.preview.setPixmap(
+                pixmap.scaled(
+                    self.preview.size(),
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+            if self._stop_event.is_set() and self.stop_button.isEnabled():
+                self._stop(final=True)
+
+        def _stop(self, final: bool = False) -> None:
+            if self._is_stopping:
+                return
+            self._is_stopping = True
+
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.status_label.setText("Stopping...")
+            self._stop_event.set()
+
+            capture = self._capture
+            self._capture = None
+            if capture is not None:
+                # Close capture first to unblock any pending read() call.
+                with contextlib.suppress(Exception):
+                    capture.close()
+
+            if self._capture_thread and self._capture_thread.is_alive():
+                self._capture_thread.join(timeout=2.0)
+            if self._worker_thread and self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=2.0)
+
+            self._capture_thread = None
+            self._worker_thread = None
+            self._jobs = None
+            with self._frame_lock:
+                self._latest_frame = None
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.status_label.setText("Stopped" if not final else "Stopped after error")
+            self._is_stopping = False
+
+        def closeEvent(self, event: object) -> None:
+            self._stop()
+            super().closeEvent(event)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = VPlayerWindow(args)
+    window.show()
+    return int(app.exec())
+
+
+def main() -> int:
+    args = parse_args()
+    if args.gui:
+        return run_gui(args)
+
+    return run_cli(args)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,21 @@ The model should show `100% GPU`, not `100% CPU`.
 
 ## Run
 
+Desktop GUI:
+
+```bash
+uv run python main.py --gui --capture portal --wayland-source Screen
+```
+
+The GUI includes:
+
+- Start/Stop controls
+- Live preview panel
+- Editable model/prompt and sampling options
+- Streaming VLM response pane
+
+If you prefer the original OpenCV player loop, run without `--gui`.
+
 Whole screen:
 
 ```bash
