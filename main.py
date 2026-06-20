@@ -8,6 +8,7 @@ import importlib
 import os
 import queue
 import select
+import signal
 import shutil
 import subprocess
 import threading
@@ -954,42 +955,48 @@ def run_gui(args: argparse.Namespace) -> int:
             self.setCentralWidget(central)
 
             root = QtWidgets.QHBoxLayout(central)
-            root.setContentsMargins(16, 16, 16, 16)
-            root.setSpacing(16)
+            root.setContentsMargins(0, 0, 0, 0)
+            root.setSpacing(0)
 
-            control_card = QtWidgets.QFrame()
-            control_card.setObjectName("controlCard")
-            control_card.setMinimumWidth(340)
-            controls = QtWidgets.QVBoxLayout(control_card)
-            controls.setContentsMargins(16, 16, 16, 16)
-            controls.setSpacing(10)
+            sidebar = QtWidgets.QFrame()
+            sidebar.setObjectName("sidebar")
+            sidebar.setFixedWidth(340)
+            controls = QtWidgets.QVBoxLayout(sidebar)
+            controls.setContentsMargins(18, 18, 18, 18)
+            controls.setSpacing(12)
 
-            title = QtWidgets.QLabel("Desktop Vision Player")
+            title = QtWidgets.QLabel("vplayer")
             title.setObjectName("title")
-            subtitle = QtWidgets.QLabel("Live capture + local Ollama VLM")
+            subtitle = QtWidgets.QLabel("Wayland capture + local vision")
             subtitle.setObjectName("subtitle")
             controls.addWidget(title)
             controls.addWidget(subtitle)
 
             self.model_edit = QtWidgets.QLineEdit(self._args.model)
+            self.model_edit.setPlaceholderText("Ollama model")
             self.prompt_edit = QtWidgets.QPlainTextEdit(self._args.prompt)
-            self.prompt_edit.setMinimumHeight(96)
+            self.prompt_edit.setMinimumHeight(110)
             self.capture_combo = QtWidgets.QComboBox()
             self.capture_combo.addItems(["auto", "portal", "mss"])
             self.capture_combo.setCurrentText(self._args.capture)
-            self.source_combo = QtWidgets.QComboBox()
-            self.source_combo.addItems(["screen", "window", "selection"])
-            self.source_combo.setCurrentText(self._args.wayland_source)
+            self.source_buttons: dict[str, object] = {}
+            self.source_group = QtWidgets.QButtonGroup(self)
+            self.source_group.setExclusive(True)
+            self.source_selector = self._source_selector()
+            self._set_source_value(self._args.wayland_source)
             self.interval_spin = QtWidgets.QDoubleSpinBox()
             self.interval_spin.setRange(0.2, 300.0)
             self.interval_spin.setValue(self._args.interval)
             self.interval_spin.setSingleStep(0.2)
+            self.interval_spin.setSuffix(" s")
             self.max_width_spin = QtWidgets.QSpinBox()
             self.max_width_spin.setRange(128, 4096)
             self.max_width_spin.setValue(self._args.max_width)
+            self.max_width_spin.setSuffix(" px")
             self.analysis_width_spin = QtWidgets.QSpinBox()
             self.analysis_width_spin.setRange(64, 2048)
             self.analysis_width_spin.setValue(self._args.analysis_width)
+            self.analysis_width_spin.setSuffix(" px")
             self.monitor_spin = QtWidgets.QSpinBox()
             self.monitor_spin.setRange(1, 16)
             self.monitor_spin.setValue(self._args.monitor)
@@ -999,55 +1006,109 @@ def run_gui(args: argparse.Namespace) -> int:
             self.jpeg_spin = QtWidgets.QSpinBox()
             self.jpeg_spin.setRange(20, 100)
             self.jpeg_spin.setValue(self._args.jpeg_quality)
+            self.jpeg_spin.setSuffix("%")
             self.timeout_spin = QtWidgets.QDoubleSpinBox()
             self.timeout_spin.setRange(5.0, 600.0)
             self.timeout_spin.setValue(self._args.vlm_timeout)
+            self.timeout_spin.setSuffix(" s")
 
-            fields: list[tuple[str, object]] = [
-                ("Model", self.model_edit),
-                ("Prompt", self.prompt_edit),
-                ("Capture", self.capture_combo),
-                ("Source", self.source_combo),
-                ("Monitor (mss)", self.monitor_spin),
-                ("Interval (s)", self.interval_spin),
-                ("Max Width", self.max_width_spin),
-                ("Analysis Width", self.analysis_width_spin),
-                ("Num Predict", self.num_predict_spin),
-                ("JPEG Quality", self.jpeg_spin),
-                ("VLM Timeout (s)", self.timeout_spin),
-            ]
-            for label_text, widget in fields:
-                label = QtWidgets.QLabel(label_text)
-                label.setObjectName("fieldLabel")
-                controls.addWidget(label)
-                controls.addWidget(widget)
+            controls.addWidget(self._section("Model", [("Model", self.model_edit), ("Prompt", self.prompt_edit)]))
+            controls.addWidget(
+                self._section(
+                    "Capture",
+                    [
+                        ("Backend", self.capture_combo),
+                        ("Wayland Source", self.source_selector),
+                        ("MSS Monitor", self.monitor_spin),
+                    ],
+                )
+            )
+            controls.addWidget(
+                self._section(
+                    "Timing",
+                    [
+                        ("Interval", self.interval_spin),
+                        ("Timeout", self.timeout_spin),
+                    ],
+                )
+            )
+            controls.addWidget(
+                self._section(
+                    "Frame",
+                    [
+                        ("Preview Width", self.max_width_spin),
+                        ("VLM Width", self.analysis_width_spin),
+                        ("Tokens", self.num_predict_spin),
+                        ("JPEG", self.jpeg_spin),
+                    ],
+                )
+            )
 
             self.start_button = QtWidgets.QPushButton("Start")
             self.stop_button = QtWidgets.QPushButton("Stop")
             self.stop_button.setEnabled(False)
+            self.start_button.setObjectName("primaryButton")
+            self.stop_button.setObjectName("secondaryButton")
             buttons = QtWidgets.QHBoxLayout()
+            buttons.setSpacing(8)
             buttons.addWidget(self.start_button)
             buttons.addWidget(self.stop_button)
             controls.addLayout(buttons)
             controls.addStretch(1)
 
-            right = QtWidgets.QVBoxLayout()
+            content = QtWidgets.QWidget()
+            content.setObjectName("content")
+            right = QtWidgets.QVBoxLayout(content)
+            right.setContentsMargins(18, 18, 18, 18)
             right.setSpacing(12)
-            self.preview = QtWidgets.QLabel("Press Start to begin capture")
+
+            toolbar = QtWidgets.QFrame()
+            toolbar.setObjectName("toolbar")
+            toolbar_layout = QtWidgets.QHBoxLayout(toolbar)
+            toolbar_layout.setContentsMargins(12, 8, 12, 8)
+            toolbar_layout.setSpacing(8)
+            self.mode_pill = QtWidgets.QLabel("Idle")
+            self.mode_pill.setObjectName("pill")
+            self.model_pill = QtWidgets.QLabel(self._args.model)
+            self.model_pill.setObjectName("pillMuted")
+            self.gpu_pill = QtWidgets.QLabel("Ollama")
+            self.gpu_pill.setObjectName("pillMuted")
+            toolbar_layout.addWidget(self.mode_pill)
+            toolbar_layout.addWidget(self.model_pill)
+            toolbar_layout.addWidget(self.gpu_pill)
+            toolbar_layout.addStretch(1)
+
+            self.preview = QtWidgets.QLabel("Press Start")
             self.preview.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             self.preview.setMinimumSize(720, 405)
             self.preview.setObjectName("preview")
+            self.preview.setScaledContents(False)
+
+            response_header = QtWidgets.QFrame()
+            response_header.setObjectName("responseHeader")
+            response_header_layout = QtWidgets.QHBoxLayout(response_header)
+            response_header_layout.setContentsMargins(0, 0, 0, 0)
+            response_title = QtWidgets.QLabel("Vision Output")
+            response_title.setObjectName("panelTitle")
+            self.response_meta = QtWidgets.QLabel("Waiting")
+            self.response_meta.setObjectName("meta")
+            response_header_layout.addWidget(response_title)
+            response_header_layout.addStretch(1)
+            response_header_layout.addWidget(self.response_meta)
+
             self.response = QtWidgets.QPlainTextEdit()
             self.response.setReadOnly(True)
-            self.response.setPlaceholderText("VLM output appears here...")
+            self.response.setPlaceholderText("VLM output appears here.")
             self.response.setObjectName("response")
-            self.response.setMinimumHeight(160)
+            self.response.setMinimumHeight(140)
 
+            right.addWidget(toolbar, stretch=0)
             right.addWidget(self.preview, stretch=1)
+            right.addWidget(response_header, stretch=0)
             right.addWidget(self.response, stretch=0)
 
-            root.addWidget(control_card)
-            root.addLayout(right, stretch=1)
+            root.addWidget(sidebar)
+            root.addWidget(content, stretch=1)
 
             self.status_label = QtWidgets.QLabel("Idle")
             self.statusBar().addPermanentWidget(self.status_label)
@@ -1055,60 +1116,215 @@ def run_gui(args: argparse.Namespace) -> int:
             self.start_button.clicked.connect(self._start)
             self.stop_button.clicked.connect(self._stop)
             self.capture_combo.currentTextChanged.connect(self._update_control_state)
+            for button in self.source_buttons.values():
+                button.clicked.connect(self._source_changed)
             self._update_control_state()
 
             self.setStyleSheet(
                 """
-                QMainWindow { background: #f3ede3; }
-                #controlCard {
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                        stop:0 #1f3a5f, stop:1 #27496d);
-                    border-radius: 16px;
+                QMainWindow { background: #111417; }
+                #sidebar {
+                    background: #181d22;
+                    border-right: 1px solid #2b323a;
                 }
-                #title { color: #f8f5ee; font-size: 22px; font-weight: 700; }
-                #subtitle { color: #d4dfeb; font-size: 13px; }
-                #fieldLabel { color: #e6edf5; font-size: 12px; margin-top: 6px; }
+                #content { background: #101316; }
+                #title { color: #f4f7f8; font-size: 24px; font-weight: 700; }
+                #subtitle { color: #8f9ba7; font-size: 13px; padding-bottom: 4px; }
+                #section {
+                    background: #20262d;
+                    border: 1px solid #2f3842;
+                    border-radius: 8px;
+                }
+                #sectionTitle {
+                    color: #dce3e8;
+                    font-size: 12px;
+                    font-weight: 700;
+                    text-transform: uppercase;
+                }
+                #fieldLabel { color: #9ca8b4; font-size: 11px; }
                 QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-                    background: rgba(255, 255, 255, 0.95);
-                    border: 1px solid rgba(0, 0, 0, 0.16);
-                    border-radius: 10px;
-                    padding: 6px;
-                    color: #0f1720;
+                    background: #11161b;
+                    border: 1px solid #34404b;
+                    border-radius: 6px;
+                    padding: 6px 8px;
+                    color: #e8edf1;
+                    selection-background-color: #3a7ca5;
                 }
+                QPlainTextEdit { line-height: 1.2; }
+                QComboBox::drop-down { border: none; width: 22px; }
                 QPushButton {
-                    background: #e9c46a;
+                    border-radius: 7px;
+                    padding: 9px 14px;
+                    font-weight: 700;
+                }
+                #primaryButton {
+                    background: #3a7ca5;
                     border: none;
-                    border-radius: 10px;
-                    padding: 8px 14px;
-                    color: #1a1a1a;
-                    font-weight: 600;
+                    color: #f8fbfc;
+                }
+                #primaryButton:hover { background: #438bb8; }
+                #secondaryButton {
+                    background: #2b323a;
+                    border: 1px solid #3a4652;
+                    color: #dbe3e8;
+                }
+                #segmented {
+                    background: #11161b;
+                    border: 1px solid #34404b;
+                    border-radius: 7px;
+                }
+                #segmentButton {
+                    background: transparent;
+                    border: none;
+                    border-radius: 5px;
+                    color: #9ca8b4;
+                    padding: 7px 6px;
+                    font-size: 12px;
+                }
+                #segmentButton:checked {
+                    background: #3a7ca5;
+                    color: #f8fbfc;
+                }
+                #segmentButton:disabled {
+                    color: #59636e;
+                    background: transparent;
                 }
                 QPushButton:disabled {
-                    background: #b9bfc6;
-                    color: #5d646d;
+                    background: #252b31;
+                    color: #687481;
+                    border: 1px solid #303841;
+                }
+                #toolbar {
+                    background: #181d22;
+                    border: 1px solid #2b323a;
+                    border-radius: 8px;
+                }
+                #pill, #pillMuted {
+                    border-radius: 6px;
+                    padding: 5px 9px;
+                    font-size: 12px;
+                    font-weight: 700;
+                }
+                #pill {
+                    background: #204b35;
+                    color: #9be7b7;
+                    border: 1px solid #2a6b48;
+                }
+                #pillMuted {
+                    background: #252c33;
+                    color: #bec8d2;
+                    border: 1px solid #333d47;
                 }
                 #preview {
-                    background: qradialgradient(cx:0.5, cy:0.4, radius:1.0,
-                        fx:0.45, fy:0.35, stop:0 #3a4f61, stop:1 #121a24);
-                    border-radius: 16px;
-                    color: #e7ecf1;
+                    background: #050607;
+                    border: 1px solid #2b323a;
+                    border-radius: 8px;
+                    color: #8f9ba7;
                     font-size: 15px;
-                    padding: 10px;
+                    padding: 12px;
+                }
+                #responseHeader {
+                    background: transparent;
+                }
+                #panelTitle {
+                    color: #e8edf1;
+                    font-size: 14px;
+                    font-weight: 700;
+                }
+                #meta {
+                    color: #8f9ba7;
+                    font-size: 12px;
                 }
                 #response {
-                    background: #fffefc;
-                    border: 1px solid #d1c6b5;
-                    border-radius: 14px;
-                    color: #192430;
+                    background: #181d22;
+                    border: 1px solid #2b323a;
+                    border-radius: 8px;
+                    color: #dce3e8;
+                    padding: 8px;
                 }
-                QStatusBar { background: #ece2d2; color: #243040; }
+                QStatusBar {
+                    background: #181d22;
+                    color: #9ca8b4;
+                    border-top: 1px solid #2b323a;
+                }
                 """
             )
+
+        def _section(
+            self,
+            title: str,
+            rows: list[tuple[str, object]],
+        ) -> object:
+            section = QtWidgets.QFrame()
+            section.setObjectName("section")
+            layout = QtWidgets.QVBoxLayout(section)
+            layout.setContentsMargins(12, 10, 12, 12)
+            layout.setSpacing(7)
+
+            heading = QtWidgets.QLabel(title)
+            heading.setObjectName("sectionTitle")
+            layout.addWidget(heading)
+
+            for label_text, widget in rows:
+                label = QtWidgets.QLabel(label_text)
+                label.setObjectName("fieldLabel")
+                layout.addWidget(label)
+                layout.addWidget(widget)
+
+            return section
+
+        def _source_selector(self) -> object:
+            selector = QtWidgets.QFrame()
+            selector.setObjectName("segmented")
+            layout = QtWidgets.QHBoxLayout(selector)
+            layout.setContentsMargins(3, 3, 3, 3)
+            layout.setSpacing(2)
+
+            for source in ("selection", "window", "screen"):
+                button = QtWidgets.QPushButton(SOURCE_LABELS[source])
+                button.setObjectName("segmentButton")
+                button.setCheckable(True)
+                self.source_group.addButton(button)
+                layout.addWidget(button)
+                self.source_buttons[source] = button
+
+            return selector
+
+        def _set_source_value(self, source: str) -> None:
+            for source_name, button in self.source_buttons.items():
+                button.setChecked(source_name == source)
+
+        def _source_value(self) -> str:
+            for source_name, button in self.source_buttons.items():
+                if button.isChecked():
+                    return source_name
+
+            return "screen"
 
         def _update_control_state(self) -> None:
             is_mss = self.capture_combo.currentText() == "mss"
             self.monitor_spin.setEnabled(is_mss)
-            self.source_combo.setEnabled(not is_mss)
+            self.source_selector.setEnabled(not is_mss)
+            for button in self.source_buttons.values():
+                button.setEnabled(not is_mss)
+
+        def _source_changed(self) -> None:
+            if self._is_stopping:
+                return
+
+            source = self._source_value()
+            if source == self._args.wayland_source:
+                return
+
+            if self._capture_thread and self._capture_thread.is_alive():
+                with self._response_lock:
+                    self._latest_response["text"] = (
+                        f"Switching capture to {SOURCE_LABELS[source]}..."
+                    )
+                self._stop()
+                QtCore.QTimer.singleShot(0, self._start)
+            else:
+                self._args.wayland_source = source
 
         def _collect_args(self) -> argparse.Namespace:
             return argparse.Namespace(
@@ -1116,7 +1332,7 @@ def run_gui(args: argparse.Namespace) -> int:
                 prompt=self.prompt_edit.toPlainText().strip() or DEFAULT_PROMPT,
                 monitor=int(self.monitor_spin.value()),
                 capture=self.capture_combo.currentText(),
-                wayland_source=self.source_combo.currentText(),
+                wayland_source=self._source_value(),
                 max_width=int(self.max_width_spin.value()),
                 analysis_width=int(self.analysis_width_spin.value()),
                 interval=float(self.interval_spin.value()),
@@ -1183,6 +1399,10 @@ def run_gui(args: argparse.Namespace) -> int:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
             self.status_label.setText("Running")
+            self.mode_pill.setText("Running")
+            self.mode_pill.setProperty("state", "running")
+            self.mode_pill.style().unpolish(self.mode_pill)
+            self.mode_pill.style().polish(self.mode_pill)
 
         def _capture_loop(self) -> None:
             assert self._capture is not None
@@ -1220,6 +1440,10 @@ def run_gui(args: argparse.Namespace) -> int:
 
             self.response.setPlainText(response_text)
             source_label = SOURCE_LABELS[self._args.wayland_source]
+            self.response_meta.setText(f"{self._args.analysis_width}px input")
+            self.mode_pill.setText(source_label)
+            self.model_pill.setText(self._args.model)
+            self.gpu_pill.setText(f"every {self._args.interval:.1f}s")
             self.status_label.setText(
                 f"{self._args.model} | {source_label} | every {self._args.interval:.1f}s"
             )
@@ -1227,9 +1451,7 @@ def run_gui(args: argparse.Namespace) -> int:
             if frame is None:
                 return
 
-            status = f"{self._args.model} | {source_label} | q in CLI only"
-            preview = draw_status(frame, status, response_text)
-            rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, _ = rgb.shape
             image = QtGui.QImage(
                 rgb.data,
@@ -1258,6 +1480,7 @@ def run_gui(args: argparse.Namespace) -> int:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.status_label.setText("Stopping...")
+            self.mode_pill.setText("Stopping")
             self._stop_event.set()
 
             capture = self._capture
@@ -1280,6 +1503,7 @@ def run_gui(args: argparse.Namespace) -> int:
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.status_label.setText("Stopped" if not final else "Stopped after error")
+            self.mode_pill.setText("Stopped" if not final else "Error")
             self._is_stopping = False
 
         def closeEvent(self, event: object) -> None:
@@ -1288,6 +1512,7 @@ def run_gui(args: argparse.Namespace) -> int:
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = VPlayerWindow(args)
+    signal.signal(signal.SIGINT, lambda _signum, _frame: window.close())
     window.show()
     return int(app.exec())
 
