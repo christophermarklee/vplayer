@@ -1,0 +1,13 @@
+[project]
+name = "vplayer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "dbus-next>=0.2.3",
+    "mss>=10.2.0",
+    "ollama>=0.6.2",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+]
